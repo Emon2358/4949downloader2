@@ -36,52 +36,84 @@ jobs:
           video_id="${{ github.event.inputs.video_id }}"
           mkdir -p downloads
           
-          # 動画をダウンロード
-          yt-dlp "https://www.nicovideo.jp/watch/${video_id}" --cookies cookies.txt -o "downloads/${video_id}.%(ext)s"
+          # 動画をダウンロードし、ファイル名を記録
+          yt-dlp "https://www.nicovideo.jp/watch/${video_id}" --cookies cookies.txt \
+            --print-json > downloads/video_info.json
+          
+          # ダウンロードした動画のパスを取得
+          video_filename=$(jq -r '.requested_downloads[0].filepath' downloads/video_info.json)
+          if [ -z "$video_filename" ]; then
+            echo "Error: Could not determine video filename from yt-dlp output."
+            exit 1
+          fi
+          # downloads ディレクトリからの相対パスにする
+          mv "$video_filename" "downloads/$(basename "$video_filename")"
+          video_filename="downloads/$(basename "$video_filename")"
 
           # サムネイルをダウンロード
-          # yt-dlpを使って最も適切なサムネイルを取得
-          yt-dlp "https://www.nicovideo.jp/watch/${video_id}" --cookies cookies.txt --write-thumbnail --skip-download --output "downloads/${video_id}.%(ext)s"
-          
+          yt-dlp "https://www.nicovideo.jp/watch/${video_id}" --cookies cookies.txt \
+            --write-thumbnail --skip-download --output "downloads/%(id)s.%(ext)s"
+
           # ダウンロードされたサムネイルのファイル名を取得
+          # yt-dlpはIDベースでサムネイルを保存するので、その形式で探す
           thumbnail_file=$(find downloads -name "${video_id}.*" -print -quit | grep -E '\.(jpg|jpeg|png|webp|gif)$')
 
           if [ -z "$thumbnail_file" ]; then
-            echo "Warning: Thumbnail not found for ID ${video_id}. Attempting fallback."
+            echo "Warning: Thumbnail not found by yt-dlp for ID ${video_id}. Attempting fallback."
             # Fallback: NicoNicoのサムネイルURLの一般的な形式を試す
             curl -L "https://tn.nicovideo.jp/smile?i=${video_id##sm}&s=M" -o downloads/${video_id}.jpg
             thumbnail_file="downloads/${video_id}.jpg"
+            if [ ! -f "$thumbnail_file" ]; then
+              echo "Error: Fallback thumbnail download failed. No thumbnail will be embedded."
+              thumbnail_file="" # サムネイルが見つからない場合は空にする
+            fi
           fi
 
-          # サムネイルをPNG形式に変換 (FFmpegで埋め込みやすい形式)
-          convert "$thumbnail_file" downloads/thumbnail.png
+          # サムネイルが存在する場合のみPNG形式に変換
+          if [ -n "$thumbnail_file" ]; then
+            convert "$thumbnail_file" downloads/thumbnail.png
+          fi
 
       - name: Convert to MP3 and Add Metadata
         run: |
           video_id="${{ github.event.inputs.video_id }}"
           title="${{ github.event.inputs.title }}"
           
-          # ダウンロードされた動画ファイルを見つける
-          video_file=$(find downloads -name "${video_id}.*" -print -quit | grep -vE '\.(jpg|jpeg|png|webp|gif)$')
-
+          # 正しい動画ファイルのパスを取得 (前のステップで移動済み)
+          video_file=$(find downloads -maxdepth 1 -name "${video_id}.*" -print -quit | grep -vE '\.(jpg|jpeg|png|webp|gif)$')
+          
           if [ -z "$video_file" ]; then
-            echo "Error: Video file not found for ID ${video_id}"
+            echo "Error: Video file not found after download and move operation for ID ${video_id}"
             exit 1
           fi
 
           output_mp3="downloads/${video_id}.mp3"
           
-          # FFmpegを使ってMP3に変換し、最高音質を設定、タイトルとアルバムアートを埋め込む
-          ffmpeg -i "$video_file" -i downloads/thumbnail.png -map 0:a -map 1:v \
-            -codec:a libmp3lame -q:a 0 \
-            -metadata:s:v comment="Cover (Front)" \
-            $(if [ -n "$title" ]; then echo "-metadata title=\"$title\""; fi) \
-            "$output_mp3"
+          # FFmpegのコマンドを動的に構築
+          ffmpeg_command="ffmpeg -i \"$video_file\""
+          if [ -f "downloads/thumbnail.png" ]; then
+            ffmpeg_command+=" -i downloads/thumbnail.png -map 0:a -map 1:v -metadata:s:v comment=\"Cover (Front)\""
+          else
+            echo "No thumbnail found or generated. MP3 will not have album art."
+            ffmpeg_command+=" -map 0:a" # サムネイルがない場合は音声のみマップ
+          fi
           
+          ffmpeg_command+=" -codec:a libmp3lame -q:a 0"
+          
+          if [ -n "$title" ]; then
+            ffmpeg_command+=" -metadata title=\"$title\""
+          fi
+          
+          ffmpeg_command+=" \"$output_mp3\""
+          
+          # 構築したコマンドを実行
+          eval "$ffmpeg_command"
+
           # 元の動画ファイルとサムネイルファイルをクリーンアップ
           rm "$video_file"
-          rm downloads/thumbnail.png
-          find downloads -name "${video_id}.*" -print -quit | grep -E '\.(jpg|jpeg|png|webp|gif)$' | xargs rm -f
+          rm -f downloads/thumbnail.png # -f でファイルがない場合もエラーにしない
+          # yt-dlpがダウンロードした元のサムネイルファイルも削除
+          find downloads -maxdepth 1 -name "${video_id}.*" -print -quit | grep -E '\.(jpg|jpeg|png|webp|gif)$' | xargs rm -f
 
       - name: Upload MP3 to Repository
         run: |
