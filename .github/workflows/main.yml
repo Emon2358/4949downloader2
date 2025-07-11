@@ -25,7 +25,7 @@ jobs:
           sudo apt-get install -y python3 python3-pip curl ffmpeg jq imagemagick
 
           # Pythonライブラリをインストール
-          pip3 install requests
+          pip3 install requests pycryptodomex
 
           # yt-dlp をインストール
           sudo curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp
@@ -36,42 +36,61 @@ jobs:
           video_id="${{ github.event.inputs.video_id }}"
           mkdir -p downloads
           
-          # 動画をダウンロードし、ファイル名を記録
+          # ダウンロードする動画の最終的なファイル名を定義
+          # yt-dlpが提供するデフォルトのフォーマットをそのまま利用し、後で特定する
+          VIDEO_OUTPUT_TEMPLATE="downloads/${video_id}.%(ext)s"
+          THUMBNAIL_OUTPUT_TEMPLATE="downloads/%(id)s.%(ext)s"
+
+          # 動画をダウンロードし、同時にサムネイルもダウンロードする
+          # --output で動画の出力パスを直接指定し、後続のmvを不要にする
+          # --write-thumbnail でサムネイルをダウンロード
+          # --no-simulate --no-warnings で余分な出力を減らす
           yt-dlp "https://www.nicovideo.jp/watch/${video_id}" --cookies cookies.txt \
+            --output "$VIDEO_OUTPUT_TEMPLATE" \
+            --write-thumbnail --embed-thumbnail --skip-download \
             --print-json > downloads/video_info.json
+
+          # ダウンロードされた動画の正確なパスを取得
+          # yt-dlpのダウンロード出力は動画ファイルパスの完全なログを提供する
+          downloaded_files=$(jq -r '.requested_downloads[].filepath' downloads/video_info.json 2>/dev/null)
           
-          # ダウンロードした動画のパスを取得
-          video_filename=$(jq -r '.requested_downloads[0].filepath' downloads/video_info.json)
-          if [ -z "$video_filename" ]; then
-            echo "Error: Could not determine video filename from yt-dlp output."
+          # 実際にダウンロードされた動画ファイルを探す
+          video_file=""
+          for f in $downloaded_files; do
+            if [[ "$f" == "downloads/${video_id}."* ]]; then
+              video_file="$f"
+              break
+            fi
+          done
+
+          if [ -z "$video_file" ] || [ ! -f "$video_file" ]; then
+            echo "Error: Video file not found after yt-dlp download for ID ${video_id}. Downloaded files: $downloaded_files"
             exit 1
           fi
-          # downloads ディレクトリからの相対パスにする
-          mv "$video_filename" "downloads/$(basename "$video_filename")"
-          video_filename="downloads/$(basename "$video_filename")"
+          echo "Detected video file: $video_file"
 
-          # サムネイルをダウンロード
-          yt-dlp "https://www.nicovideo.jp/watch/${video_id}" --cookies cookies.txt \
-            --write-thumbnail --skip-download --output "downloads/%(id)s.%(ext)s"
-
-          # ダウンロードされたサムネイルのファイル名を取得
-          # yt-dlpはIDベースでサムネイルを保存するので、その形式で探す
-          thumbnail_file=$(find downloads -name "${video_id}.*" -print -quit | grep -E '\.(jpg|jpeg|png|webp|gif)$')
+          # サムネイルファイルを特定
+          # yt-dlpがembed-thumbnailで埋め込むので、別途サムネイルファイルをダウンロードする必要はなくなるが
+          # 念のため、yt-dlpが書き出したサムネイルファイルも特定
+          thumbnail_file=$(find downloads -maxdepth 1 -name "${video_id}.*" -print -quit | grep -E '\.(jpg|jpeg|png|webp|gif)$')
 
           if [ -z "$thumbnail_file" ]; then
-            echo "Warning: Thumbnail not found by yt-dlp for ID ${video_id}. Attempting fallback."
+            echo "Warning: yt-dlp did not directly write a thumbnail file for ID ${video_id}. Attempting fallback."
             # Fallback: NicoNicoのサムネイルURLの一般的な形式を試す
             curl -L "https://tn.nicovideo.jp/smile?i=${video_id##sm}&s=M" -o downloads/${video_id}.jpg
             thumbnail_file="downloads/${video_id}.jpg"
             if [ ! -f "$thumbnail_file" ]; then
-              echo "Error: Fallback thumbnail download failed. No thumbnail will be embedded."
+              echo "Error: Fallback thumbnail download failed. No separate thumbnail file will be used for embedding (FFmpeg might still get it from video)."
               thumbnail_file="" # サムネイルが見つからない場合は空にする
             fi
           fi
 
           # サムネイルが存在する場合のみPNG形式に変換
-          if [ -n "$thumbnail_file" ]; then
+          if [ -n "$thumbnail_file" ] && [ -f "$thumbnail_file" ]; then
             convert "$thumbnail_file" downloads/thumbnail.png
+            echo "Converted thumbnail to downloads/thumbnail.png"
+          else
+            echo "No suitable thumbnail file found or generated for direct embedding."
           fi
 
       - name: Convert to MP3 and Add Metadata
@@ -79,22 +98,27 @@ jobs:
           video_id="${{ github.event.inputs.video_id }}"
           title="${{ github.event.inputs.title }}"
           
-          # 正しい動画ファイルのパスを取得 (前のステップで移動済み)
+          # 正しい動画ファイルのパスを再取得
           video_file=$(find downloads -maxdepth 1 -name "${video_id}.*" -print -quit | grep -vE '\.(jpg|jpeg|png|webp|gif)$')
           
           if [ -z "$video_file" ]; then
-            echo "Error: Video file not found after download and move operation for ID ${video_id}"
+            echo "Error: Video file not found at conversion stage for ID ${video_id}"
             exit 1
           fi
+          echo "Converting video file: $video_file"
 
           output_mp3="downloads/${video_id}.mp3"
           
           # FFmpegのコマンドを動的に構築
           ffmpeg_command="ffmpeg -i \"$video_file\""
+          
+          # yt-dlpが既にサムネイルを埋め込んでいる可能性もあるが、別途ダウンロードしたサムネイルを明示的に埋め込む
+          # ただし、元の動画にサムネイルが含まれている場合は、そちらが優先される可能性もある
           if [ -f "downloads/thumbnail.png" ]; then
             ffmpeg_command+=" -i downloads/thumbnail.png -map 0:a -map 1:v -metadata:s:v comment=\"Cover (Front)\""
+            echo "Embedding downloads/thumbnail.png as album art."
           else
-            echo "No thumbnail found or generated. MP3 will not have album art."
+            echo "No explicit thumbnail.png found. Attempting to extract audio only (FFmpeg might pick up embedded thumbnail)."
             ffmpeg_command+=" -map 0:a" # サムネイルがない場合は音声のみマップ
           fi
           
@@ -102,18 +126,23 @@ jobs:
           
           if [ -n "$title" ]; then
             ffmpeg_command+=" -metadata title=\"$title\""
+            echo "Embedding title: \"$title\""
           fi
           
           ffmpeg_command+=" \"$output_mp3\""
           
           # 構築したコマンドを実行
+          echo "Executing FFmpeg command: $ffmpeg_command"
           eval "$ffmpeg_command"
 
-          # 元の動画ファイルとサムネイルファイルをクリーンアップ
-          rm "$video_file"
-          rm -f downloads/thumbnail.png # -f でファイルがない場合もエラーにしない
+          # 元の動画ファイルとダウンロードしたサムネイルファイルをクリーンアップ
+          echo "Cleaning up files..."
+          rm -f "$video_file"
+          rm -f downloads/thumbnail.png
           # yt-dlpがダウンロードした元のサムネイルファイルも削除
+          # ここでは、downloads/${video_id}から始まるファイルで、画像拡張子のものをすべて削除
           find downloads -maxdepth 1 -name "${video_id}.*" -print -quit | grep -E '\.(jpg|jpeg|png|webp|gif)$' | xargs rm -f
+          echo "Cleanup complete."
 
       - name: Upload MP3 to Repository
         run: |
@@ -122,6 +151,12 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
           # ダウンロードしたMP3をコミットしてプッシュ
-          git add "downloads/${video_id}.mp3"
-          git commit -m "Add downloaded MP3 with thumbnail: ${video_id}"
-          git push
+          if [ -f "downloads/${video_id}.mp3" ]; then
+            git add "downloads/${video_id}.mp3"
+            git commit -m "Add downloaded MP3 with thumbnail: ${video_id}"
+            git push
+            echo "MP3 uploaded successfully."
+          else
+            echo "Error: MP3 file downloads/${video_id}.mp3 not found for upload."
+            exit 1
+          fi
